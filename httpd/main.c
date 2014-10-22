@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <unistd.h>
 
@@ -20,12 +21,36 @@ enum err_type {
 };
 
 #define SOCK_BACKLOG 5
+#define URL_MAX_LENGTH 1024
+#define REQUEST_MAX_LENGTH 4096
+#define METHOD_MAX_LENGTH 16
+#define PATH_MAX_LENGTH URL_MAX_LENGTH * 2
 
-/* 
+#define DOCS_PATH "htdocs"
+#define DEFAULT_PAGE "index.html"
+
+int init_sock(u_short *port);
+void exit_sock(int sockfd);
+
+void accept_request(int sockfd);
+int is_excutable(const char* path, struct stat st);
+
+void return_404(int sockfd);
+void return_501(int sockfd);
+
+void hdlr_signal(int signo);
+
+void log_msg(const char* msg);
+
+#define skip_space(ptr, ori, len) while ((isspace(*(ptr++))) && ((ptr - ori) < len)); ptr--
+#define read_string(to, ori, from, len) while ((! isspace(*from)) && ((to - ori) < len)) \
+    *(to++) = *(from++)
+
+/*
  * References:
  *      http://beej.us/net2/html/syscalls.html
  *      http://man7.org/linux/man-pages/man2/getsockname.2.html
- * 
+ *
  * Others:
  *      PF stands for Protocol Family
  *      AF stands for Address Family
@@ -38,16 +63,6 @@ enum err_type {
  *      SOCK_DGRAM bases on UDP
  *
  */
-
-int init_sock(u_short *port);
-void exit_sock(int sockfd);
-void log_msg(const char* msg);
-void accept_request(int sockfd);
-void method_unimplement(int sockfd);
-void method_implement(int sockfd);
-
-void hdlr_signal(int signo);
-
 int init_sock(u_short *port) {
     int sockfd = 0;
     
@@ -81,37 +96,117 @@ void exit_sock(int sockfd) {
     close(sockfd);
 }
 
-void log_msg(const char* msg) {
-    printf("%s\n", msg);
+void return_cgi(int sockfd, const char* path, const char* method, const char* query) {
+}
+
+void return_header(int sockfd, const char* path) {
+    char buf[1024];
+    
+    sprintf(buf, "HTTP/1.0 200 OK\r\n");
+    send(sockfd, buf, strlen(buf), 0);
+    sprintf(buf, "Content-Type: text/html\r\n");    // Determind the mime by filename
+    send(sockfd, buf, strlen(buf), 0);
+    sprintf(buf, "\r\n");
+    send(sockfd, buf, strlen(buf), 0);
+}
+
+void return_content(int sockfd, FILE* file) {
+    char buf[1024];
+    
+    fgets(buf, sizeof(buf), file);
+    do {
+        send(sockfd, buf, strlen(buf), 0);
+        fgets(buf, sizeof(buf), file);
+    } while (! feof(file));
+}
+
+void return_file(int sockfd, const char* path) {
+    FILE *file =  NULL;
+    
+    if ((file = fopen(path, "r")) == NULL)
+        return return_404(sockfd);
+    
+    return_header(sockfd, path);
+    return_content(sockfd, file);
+    
+    fclose(file);
+    close(sockfd);
 }
 
 /*
  * References:
  *      http://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html
- *
- *
  */
 
 void accept_request(int sockfd) {
-    char buf[1024];
-    char* b_ptr = buf;
-    char method[16];
-    char* m_ptr = method;
-    
-    int len = read(sockfd, buf, sizeof(buf));
+    char buf[REQUEST_MAX_LENGTH] = { 0 };
+    char *b_ptr = buf;
 
-    while ((! isspace(*b_ptr)) && ((m_ptr - method) < sizeof(method) - 1))
-        *(m_ptr++) = *(b_ptr++);
+    char method[METHOD_MAX_LENGTH] = { 0 };
+    char *t_ptr = NULL;
     
-    *m_ptr = '\0';
-    log_msg(method);
+    char url[URL_MAX_LENGTH] = { 0 };
+    char *query = url;
+
+    if (0 >= read(sockfd, buf, sizeof(buf))) {
+        close(sockfd);
+        return log_msg("Empty request");
+    }
+    
+    t_ptr = method;
+    read_string(t_ptr, method, b_ptr, sizeof(method));
+
     if (strcasecmp(method, "GET") && strcasecmp(method, "POST"))
-        return method_unimplement(sockfd);
+        return_501(sockfd);
+
+    skip_space(b_ptr, buf, sizeof(buf));
+
+    t_ptr = url;
+    read_string(t_ptr, url, b_ptr, sizeof(method));
+    
+    while ((*query != '?') && (*query != '\0'))
+        query++;
+    if (*query == '?')
+        *(query++) = '\0';
+    
+    char path[PATH_MAX_LENGTH] = { 0 };
+
+    sprintf(path, "%s%s", DOCS_PATH, url);
+    if (path[strlen(path) - 1] == '/')
+        strcat(path, DEFAULT_PAGE);
+    
+    struct stat st;
+    if (stat(path, &st) == -1)
+        return return_404(sockfd);
+    
+    if ((st.st_mode & S_IFMT) == S_IFDIR) {
+        strcat(path, "/");
+        strcat(path, DEFAULT_PAGE);
+    }
+    
+    if (is_excutable(path, st))
+        return_cgi(sockfd, path, method, query);
     else
-        return method_implement(sockfd);
+        return_file(sockfd, path);
 }
 
-void method_unimplement(int sockfd)
+int is_excutable(const char* path, struct stat st) {
+    // Not accurate
+    return (st.st_mode & S_IXUSR) ||
+           (st.st_mode & S_IXGRP) ||
+           (st.st_mode & S_IXOTH);
+}
+
+void return_404(int sockfd) {
+    char buf[1024];
+    
+    sprintf(buf, "HTTP/1.0 404 Page not found\r\n");
+    send(sockfd, buf, strlen(buf), 0);
+    
+    close(sockfd);
+}
+
+void return_501(int sockfd)
 {
     char buf[1024];
     
@@ -133,29 +228,11 @@ void method_unimplement(int sockfd)
     close(sockfd);
 }
 
-void method_implement(int sockfd)
-{
-    char buf[1024];
-    
-    sprintf(buf, "HTTP/1.0 200\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "Content-Type: text/html\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "<HTML><HEAD><TITLE>Method Implemented\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "</TITLE></HEAD>\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "<BODY><P>HTTP request method supported.\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "</BODY></HTML>\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    
-    close(sockfd);
+void hdlr_signal(int signo) {
 }
 
-void hdlr_signal(int signo) {
+void log_msg(const char* msg) {
+    printf("%s\n", msg);
 }
 
 int main(int argc, const char * argv[]) {
@@ -175,7 +252,7 @@ int main(int argc, const char * argv[]) {
         else
             accept_request(c_sock);
     }
-    
+
     exit_sock(s_sock);
     
     return 0;
