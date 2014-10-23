@@ -22,7 +22,7 @@ enum err_type {
 
 #define SOCK_BACKLOG 5
 #define URL_MAX_LENGTH 1024
-#define REQUEST_MAX_LENGTH 4096
+#define REQUEST_BUF_LENGTH 1024
 #define METHOD_MAX_LENGTH 16
 #define PATH_MAX_LENGTH URL_MAX_LENGTH * 2
 
@@ -35,7 +35,9 @@ void exit_sock(int sockfd);
 void accept_request(int sockfd);
 int is_excutable(const char* path, struct stat st);
 
+void return_header(int sockfd, const char* path);
 void return_404(int sockfd);
+void return_500(int sockfd);
 void return_501(int sockfd);
 
 void hdlr_signal(int signo);
@@ -96,22 +98,84 @@ void exit_sock(int sockfd) {
     close(sockfd);
 }
 
+/* 
+ * Refereneces:
+ *      http://en.wikipedia.org/wiki/Fork_(system_call)
+ *      http://www.cs.tut.fi/~jkorpela/forms/cgic.html
+ *
+ */
+
 void return_cgi(int sockfd, const char* path, const char* method, const char* query) {
+    int input[2], output[2];
+    pid_t pid;
+    int status;
+    int content_length = 0;
+    
+    if ((pipe(input) < 0) || (pipe(output) < 0))
+        return return_500(sockfd);
+    
+    if (0 > (pid = fork()))
+        return return_500(sockfd);
+    
+    if (pid == 0) {
+        dup2(output[1], STDOUT_FILENO);
+        dup2(input[0], STDIN_FILENO);
+        
+        close(output[0]);
+        close(input[1]);
+        
+        char env[URL_MAX_LENGTH];
+        char buf[REQUEST_BUF_LENGTH];
+        
+        sprintf(env, "REQUEST_METHOD=%s", method);
+        putenv(env);
+        sprintf(env, "QUERY_LENGTH=%s", query);
+        putenv(env);
+        
+        while ((get_line(sockfd, buf, sizeof(buf)) > 0) && strcmp("\n", buf)) {
+            buf[15] = '\0';
+            if (strcasecmp(buf, "Content-Length:") == 0) {
+                content_length = atoi(buf+16);
+                sprintf(env, "CONTENT_LENGTH=%d", content_length);
+                putenv(env);
+            }
+        }
+
+        execl(path, path, NULL);
+        exit(0);
+    } else {
+        close(output[1]);
+        close(input[0]);
+
+        char c;
+        int i;
+
+        for (i = 0; i < content_length; i++) {
+            recv(sockfd, &c, 1, 0);
+            write(input[1], &c, 1);
+        }
+
+        return_header(sockfd, path);
+        while (read(output[0], &c, 1) > 0)
+            send(sockfd, &c, 1, 0);
+
+        close(output[0]);
+        close(input[1]);
+        waitpid(pid, &status, 0);
+    }
+    
+    close(sockfd);
 }
 
 void return_header(int sockfd, const char* path) {
-    char buf[1024];
+    char buf[REQUEST_BUF_LENGTH];
     
     sprintf(buf, "HTTP/1.0 200 OK\r\n");
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "Content-Type: text/html\r\n");    // Determind the mime by filename
-    send(sockfd, buf, strlen(buf), 0);
-    sprintf(buf, "\r\n");
     send(sockfd, buf, strlen(buf), 0);
 }
 
 void return_content(int sockfd, FILE* file) {
-    char buf[1024];
+    char buf[REQUEST_BUF_LENGTH];
     
     fgets(buf, sizeof(buf), file);
     do {
@@ -122,15 +186,41 @@ void return_content(int sockfd, FILE* file) {
 
 void return_file(int sockfd, const char* path) {
     FILE *file =  NULL;
+    char buf[REQUEST_BUF_LENGTH];
     
     if ((file = fopen(path, "r")) == NULL)
         return return_404(sockfd);
     
     return_header(sockfd, path);
+    sprintf(buf, "Content-Type: text/html\r\n");    // Determind the mime by filename
+    send(sockfd, buf, strlen(buf), 0);
+    sprintf(buf, "\r\n");
+    send(sockfd, buf, strlen(buf), 0);
     return_content(sockfd, file);
     
     fclose(file);
     close(sockfd);
+}
+
+int get_line(int sockfd, char *buf, int size) {
+    char *ptr = buf;
+    char c = '\0';
+    
+    while ((ptr - buf < size) && (c != '\n')) {
+        if (recv(sockfd, &c, 1, 0) > 0) {
+            if ('\r' == c)
+                if ((recv(sockfd, &c, 1, MSG_PEEK) > 0) && ('\n' == c))
+                    recv(sockfd, &c, 1, 0);
+                else
+                    c = '\n';
+            *(ptr++) = c;
+        } else {
+            break;
+        }
+    }
+    
+    *ptr = '\0';
+    return (ptr - buf);
 }
 
 /*
@@ -139,7 +229,7 @@ void return_file(int sockfd, const char* path) {
  */
 
 void accept_request(int sockfd) {
-    char buf[REQUEST_MAX_LENGTH] = { 0 };
+    char buf[REQUEST_BUF_LENGTH] = { 0 };
     char *b_ptr = buf;
 
     char method[METHOD_MAX_LENGTH] = { 0 };
@@ -148,7 +238,7 @@ void accept_request(int sockfd) {
     char url[URL_MAX_LENGTH] = { 0 };
     char *query = url;
 
-    if (0 >= read(sockfd, buf, sizeof(buf))) {
+    if (0 >= get_line(sockfd, buf, sizeof(buf))) {
         close(sockfd);
         return log_msg("Empty request");
     }
@@ -198,7 +288,7 @@ int is_excutable(const char* path, struct stat st) {
 }
 
 void return_404(int sockfd) {
-    char buf[1024];
+    char buf[REQUEST_BUF_LENGTH];
     
     sprintf(buf, "HTTP/1.0 404 Page not found\r\n");
     send(sockfd, buf, strlen(buf), 0);
@@ -206,9 +296,20 @@ void return_404(int sockfd) {
     close(sockfd);
 }
 
+void return_500(int sockfd) {
+    char buf[REQUEST_BUF_LENGTH];
+    
+    sprintf(buf, "HTTP/1.0 500 Internal Server Error\r\n");
+    send(sockfd, buf, strlen(buf), 0);
+    sprintf(buf, "Content-Type: text/html\r\n");
+    send(sockfd, buf, strlen(buf), 0);
+    
+    close(sockfd);
+}
+
 void return_501(int sockfd)
 {
-    char buf[1024];
+    char buf[REQUEST_BUF_LENGTH];
     
     sprintf(buf, "HTTP/1.0 501 Method Not Implemented\r\n");
     send(sockfd, buf, strlen(buf), 0);
